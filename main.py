@@ -6,6 +6,7 @@ import hashlib
 import secrets
 from pathlib import Path
 from typing import Generator
+import os
 
 app = FastAPI()
 
@@ -24,7 +25,8 @@ app.add_middleware(
 
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect("users.db")
+    db_path = os.getenv("DATABASE_PATH", "users.db")
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users ("  # noqa: E501
@@ -38,6 +40,7 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
         ")"
     )
     _ensure_user_columns(conn)
+    _ensure_clients_table(conn)
     try:
         yield conn
     finally:
@@ -50,6 +53,18 @@ def _ensure_user_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
     if "last_name" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
+
+
+def _ensure_clients_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS clients ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "tax_id TEXT UNIQUE,"
+        "full_name TEXT NOT NULL,"
+        "email TEXT NOT NULL"
+        ")"
+    )
+    seed_clients(conn)
 
 
 class RegisterRequest(BaseModel):
@@ -71,6 +86,12 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     code: str
     new_password: str
+
+
+class ClientResponse(BaseModel):
+    tax_id: str
+    name: str
+    email: str
 
 
 def hash_password(password: str) -> str:
@@ -147,7 +168,7 @@ def reset_password(req: ResetPasswordRequest, db: sqlite3.Connection = Depends(g
     cur = db.execute("SELECT id FROM users WHERE reset_token = ?", (req.code,))
     row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=400, detail="Código de recuperación invalido")
+        raise HTTPException(status_code=400, detail="Invalid token")
     hashed = hash_password(req.new_password)
     db.execute(
         "UPDATE users SET password = ?, reset_token = NULL WHERE id = ?",
@@ -155,6 +176,25 @@ def reset_password(req: ResetPasswordRequest, db: sqlite3.Connection = Depends(g
     )
     db.commit()
     return {"message": "Password updated"}
+
+
+@app.get("/clients/{tax_id}", response_model=ClientResponse)
+def get_client(tax_id: str, db: sqlite3.Connection = Depends(get_db)):
+    normalized = tax_id.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="La cédula o NIT es obligatoria")
+    cur = db.execute(
+        "SELECT tax_id, full_name, email FROM clients WHERE tax_id = ?",
+        (normalized,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    return {
+        "tax_id": row["tax_id"],
+        "name": row["full_name"],
+        "email": row["email"],
+    }
 
 
 OUTBOX_DIR = Path("outbox")
@@ -176,3 +216,20 @@ def _send_reset_code_via_email(email: str, code: str) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def seed_clients(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("SELECT COUNT(*) FROM clients")
+    count = cur.fetchone()[0]
+    if count:
+        return
+    sample_clients = [
+        ("1014262008", "Wilbert Rozo", "wilberth.rozo@example.com"),
+        ("1000285691", "Eduardo Vargas", "eduardo.vargas@example.com"),
+        ("1192891795", "santiago Ramos", "santiago.ramos@example.com"),
+    ]
+    conn.executemany(
+        "INSERT OR IGNORE INTO clients (tax_id, full_name, email) VALUES (?, ?, ?)",
+        sample_clients,
+    )
+    conn.commit()
