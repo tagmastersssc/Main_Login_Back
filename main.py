@@ -10,15 +10,18 @@ import os
 
 app = FastAPI()
 
+def _parse_allowed_origins() -> list[str]:
+    raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+    origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
+    return origins or ["*"]
+
+allowed_origins = _parse_allowed_origins()
+allow_credentials = "*" not in allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
