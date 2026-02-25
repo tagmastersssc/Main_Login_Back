@@ -33,6 +33,7 @@ Variables clave:
 - `OIDC_TENANT_ID`
 - `OIDC_CLIENT_ID`
 - `OIDC_CLIENT_SECRET` (opcional si tu app está configurada para Authorization Code + PKCE)
+- `OIDC_PUBLIC_CLIENT` (`true` para app pública sin secret; `false` para confidential client)
 - `SSO_REDIRECT_URI`
 - `LOGIN_FRONT_URL`
 - `CLIENTS_APP_URL`

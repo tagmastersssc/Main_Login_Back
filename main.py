@@ -38,6 +38,7 @@ OIDC_DISCOVERY_URL = os.getenv("OIDC_DISCOVERY_URL", "").strip()
 OIDC_TENANT_ID = os.getenv("OIDC_TENANT_ID", "").strip()
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "").strip()
 OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "").strip()
+OIDC_PUBLIC_CLIENT = env_bool("OIDC_PUBLIC_CLIENT", False)
 OIDC_SCOPE = (os.getenv("OIDC_SCOPE", "openid profile email") or "openid profile email").strip()
 OIDC_PROVIDER_HINT_PARAM = (os.getenv("OIDC_PROVIDER_HINT_PARAM", "idp") or "idp").strip()
 OIDC_PROVIDER_HINTS = {
@@ -384,6 +385,35 @@ def _redirect_to_login_with_error(request: Request, message: str) -> RedirectRes
     return RedirectResponse(str(login_url), status_code=302)
 
 
+def _sso_token_exchange_error(response: httpx.Response) -> str:
+    message = "No se pudo intercambiar el código SSO."
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        provider_error = str(payload.get("error") or "").strip()
+        provider_description = str(payload.get("error_description") or "").strip()
+        if provider_error and provider_description:
+            compact_desc = " ".join(provider_description.split())
+            return f"{message} {provider_error}: {compact_desc[:280]}"
+        if provider_error:
+            return f"{message} {provider_error}"
+
+    raw_body = " ".join((response.text or "").split())[:160]
+    if raw_body:
+        return f"{message} {raw_body}"
+    return message
+
+
+def _extract_aadsts_code(error_text: str) -> str:
+    match = re.search(r"AADSTS\d+", error_text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).upper()
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -412,10 +442,8 @@ def sso_start(
         return _redirect_to_login_with_error(request, exc.detail)
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
-    code_verifier = None
-
-    if not OIDC_CLIENT_SECRET:
-        code_verifier, code_challenge = _create_pkce_pair()
+    # Always use PKCE. Some Entra configurations require it even with server-side code redemption.
+    code_verifier, code_challenge = _create_pkce_pair()
 
     db.execute(
         "INSERT INTO sso_states (state, nonce, provider, code_verifier, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -437,9 +465,8 @@ def sso_start(
     hint_value = OIDC_PROVIDER_HINTS.get(provider_key)
     if hint_value:
         params[OIDC_PROVIDER_HINT_PARAM] = hint_value
-    if code_verifier:
-        params["code_challenge"] = code_challenge
-        params["code_challenge_method"] = "S256"
+    params["code_challenge"] = code_challenge
+    params["code_challenge_method"] = "S256"
 
     authorize_url = f"{oidc['authorization_endpoint']}?{urlencode(params)}"
     return RedirectResponse(authorize_url, status_code=302)
@@ -486,14 +513,33 @@ def sso_callback(
         "redirect_uri": _get_redirect_uri(request),
         "client_id": OIDC_CLIENT_ID,
     }
-    if OIDC_CLIENT_SECRET:
+    if OIDC_CLIENT_SECRET and not OIDC_PUBLIC_CLIENT:
         token_payload["client_secret"] = OIDC_CLIENT_SECRET
     if row["code_verifier"]:
         token_payload["code_verifier"] = row["code_verifier"]
 
     token_response = httpx.post(oidc["token_endpoint"], data=token_payload, timeout=15)
     if token_response.status_code >= 400:
-        return _redirect_to_login_with_error(request, "No se pudo intercambiar el código SSO.")
+        first_error = _sso_token_exchange_error(token_response)
+        aadsts_code = _extract_aadsts_code(first_error)
+        sent_secret = "client_secret" in token_payload
+
+        # Entra sometimes fails when app type and token payload are not aligned.
+        # Retry once with the opposite secret strategy to smooth misconfiguration transitions.
+        if aadsts_code == "AADSTS7000218" and not sent_secret and OIDC_CLIENT_SECRET:
+            retry_payload = dict(token_payload)
+            retry_payload["client_secret"] = OIDC_CLIENT_SECRET
+            token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+        elif aadsts_code == "AADSTS700025" and sent_secret:
+            retry_payload = dict(token_payload)
+            retry_payload.pop("client_secret", None)
+            token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+        else:
+            token_response = token_response
+
+        if token_response.status_code >= 400:
+            final_error = _sso_token_exchange_error(token_response)
+            return _redirect_to_login_with_error(request, final_error)
 
     token_data = token_response.json()
     id_token = token_data.get("id_token")
