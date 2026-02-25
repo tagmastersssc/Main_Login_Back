@@ -545,6 +545,7 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+@app.get("/api/auth/sso/providers")
 @app.get("/auth/sso/providers")
 def get_sso_providers():
     return {
@@ -582,6 +583,7 @@ def runtime_config_js_api(request: Request):
     return runtime_config_js(request)
 
 
+@app.get("/api/auth/sso/start")
 @app.get("/auth/sso/start")
 def sso_start(
     request: Request,
@@ -628,6 +630,7 @@ def sso_start(
     return RedirectResponse(authorize_url, status_code=302)
 
 
+@app.get("/api/auth/sso/callback")
 @app.get("/auth/sso/callback", name="sso_callback")
 def sso_callback(
     request: Request,
