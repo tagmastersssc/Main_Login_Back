@@ -57,6 +57,8 @@ También puedes usar el script local para forzar el `venv` correcto:
 
 | Método | Ruta | Descripción |
 |---|---|---|
+| GET | `/runtime-config` | Configuración runtime para frontends (JSON) |
+| GET | `/runtime-config.js` | Configuración runtime para frontends (script global) |
 | GET | `/auth/sso/providers` | Estado y proveedores SSO disponibles |
 | GET | `/auth/sso/start` | Inicia autenticación SSO |
 | GET | `/auth/sso/callback` | Callback del proveedor OIDC |
@@ -79,3 +81,8 @@ Tienes dos opciones:
    - En `App registrations > Authentication`, cambia `Supported account types` a cuentas de cualquier directorio organizacional.
    - En backend usa `OIDC_DISCOVERY_URL=https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration`.
    - Mantén `REQUIRE_ALLOWLIST=true` y controla acceso con `ALLOWED_EMAILS`.
+
+## Runtime config sin rebuild de frontend
+
+Si Terraform y pipeline no comparten variables de build, puedes definir `VITE_*` como variables de entorno del backend.
+El backend las expone en `/runtime-config.js` y los frontends las leen en tiempo de ejecución.

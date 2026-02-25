@@ -17,7 +17,7 @@ import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from jwt import InvalidTokenError
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
@@ -490,6 +490,21 @@ def _redirect_to_login_with_error(request: Request, message: str) -> RedirectRes
     return RedirectResponse(str(login_url), status_code=302)
 
 
+def _get_runtime_frontend_config(request: Request) -> dict[str, str]:
+    default_whatsapp = "https://wa.me/573001112233?text=Hola%20BilAI%2C%20quiero%20conocer%20la%20plataforma."
+    site_url = (os.getenv("VITE_SITE_URL", "").strip() or _base_origin(request)).rstrip("/")
+    return {
+        "VITE_API_URL": (os.getenv("VITE_API_URL", "/api") or "/api").strip(),
+        "VITE_WEBSITE_URL": (os.getenv("VITE_WEBSITE_URL", "/") or "/").strip(),
+        "VITE_LOGIN_URL": (os.getenv("VITE_LOGIN_URL", "/login") or "/login").strip(),
+        "VITE_LOGIN_APP_URL": (os.getenv("VITE_LOGIN_APP_URL", "/login") or "/login").strip(),
+        "VITE_WHATSAPP_URL": (os.getenv("VITE_WHATSAPP_URL", default_whatsapp) or default_whatsapp).strip(),
+        "VITE_CONTACT_EMAIL": (os.getenv("VITE_CONTACT_EMAIL", "hola@bilai.co") or "hola@bilai.co").strip(),
+        "VITE_GA_MEASUREMENT_ID": (os.getenv("VITE_GA_MEASUREMENT_ID", "") or "").strip(),
+        "VITE_SITE_URL": site_url,
+    }
+
+
 def _sso_token_exchange_error(response: httpx.Response) -> str:
     message = "No se pudo intercambiar el código SSO."
     try:
@@ -536,6 +551,35 @@ def get_sso_providers():
         "enabled": bool(_effective_discovery_url() and OIDC_CLIENT_ID),
         "providers": ["google", "microsoft", "apple"],
     }
+
+
+@app.get("/runtime-config")
+def runtime_config(request: Request):
+    return _get_runtime_frontend_config(request)
+
+
+@app.get("/runtime-config.js")
+def runtime_config_js(request: Request):
+    payload = json.dumps(_get_runtime_frontend_config(request), ensure_ascii=False)
+    script = (
+        "window.__BILAI_RUNTIME_CONFIG__ = "
+        f"Object.assign({{}}, window.__BILAI_RUNTIME_CONFIG__ || {{}}, {payload});"
+    )
+    return Response(
+        content=script,
+        media_type="application/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/runtime-config")
+def runtime_config_api(request: Request):
+    return _get_runtime_frontend_config(request)
+
+
+@app.get("/api/runtime-config.js")
+def runtime_config_js_api(request: Request):
+    return runtime_config_js(request)
 
 
 @app.get("/auth/sso/start")
