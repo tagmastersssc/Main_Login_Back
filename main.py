@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Generator
 from urllib.parse import urlencode
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -17,7 +18,8 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from jwt import InvalidTokenError, PyJWKClient
+from jwt import InvalidTokenError
+from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
 from starlette.datastructures import URL
 
@@ -63,6 +65,26 @@ ALLOWED_EMAILS = {
 SSO_STATE_TTL_SECONDS = int(os.getenv("SSO_STATE_TTL_SECONDS", "900"))
 
 
+@app.middleware("http")
+async def sso_callback_error_guard(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:  # noqa: BLE001
+        if request.url.path == "/auth/sso/callback":
+            fallback_url = os.getenv("LOGIN_FRONT_URL", LOGIN_FRONT_URL_DEFAULT).strip() or LOGIN_FRONT_URL_DEFAULT
+            if fallback_url.startswith("http://") or fallback_url.startswith("https://"):
+                login_url = fallback_url
+            else:
+                base_origin = f"{request.url.scheme}://{request.url.netloc}"
+                normalized = fallback_url if fallback_url.startswith("/") else f"/{fallback_url}"
+                login_url = str(URL(base_origin).replace(path=normalized))
+            redirect = URL(login_url).include_query_params(
+                error="Ocurrió un error interno al finalizar el acceso SSO. Intenta nuevamente.",
+            )
+            return RedirectResponse(str(redirect), status_code=302)
+        raise
+
+
 def _parse_allowed_origins() -> list[str]:
     raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
     origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
@@ -82,7 +104,7 @@ app.add_middleware(
 
 
 OIDC_CONFIG_CACHE: dict[str, object] = {"data": None, "fetched_at": 0}
-JWK_CLIENT_CACHE: dict[str, PyJWKClient] = {}
+JWKS_CACHE: dict[str, dict[str, object]] = {}
 
 
 class RegisterRequest(BaseModel):
@@ -245,13 +267,86 @@ def _get_oidc_configuration() -> dict[str, str]:
     return data
 
 
-def _get_jwk_client(jwks_uri: str) -> PyJWKClient:
-    cached = JWK_CLIENT_CACHE.get(jwks_uri)
-    if cached:
-        return cached
-    client = PyJWKClient(jwks_uri)
-    JWK_CLIENT_CACHE[jwks_uri] = client
-    return client
+def _get_jwks(jwks_uri: str, *, force_refresh: bool = False) -> list[dict]:
+    now = int(time.time())
+    cached_entry = JWKS_CACHE.get(jwks_uri, {})
+    cached_keys = cached_entry.get("keys")
+    cached_at = int(cached_entry.get("fetched_at") or 0)
+    if (
+        not force_refresh
+        and isinstance(cached_keys, list)
+        and cached_keys
+        and (now - cached_at) < 3600
+    ):
+        return cached_keys
+
+    try:
+        response = httpx.get(jwks_uri, timeout=12)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo conectar al endpoint de llaves (JWKS) del proveedor SSO.",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail="El proveedor SSO devolvió error al consultar las llaves públicas (JWKS).",
+        )
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="El proveedor SSO devolvió un JWKS inválido.",
+        ) from exc
+
+    keys = payload.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(
+            status_code=502,
+            detail="El JWKS del proveedor SSO no contiene llaves válidas.",
+        )
+
+    JWKS_CACHE[jwks_uri] = {"keys": keys, "fetched_at": now}
+    return keys
+
+
+def _resolve_signing_key_from_jwks(id_token: str, jwks_uri: str):
+    try:
+        header = jwt.get_unverified_header(id_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Token SSO inválido (header).") from exc
+
+    kid = str(header.get("kid") or "").strip()
+    if not kid:
+        raise HTTPException(status_code=401, detail="Token SSO inválido (kid faltante).")
+
+    def find_key(keys: list[dict]):
+        for jwk in keys:
+            if str(jwk.get("kid") or "").strip() == kid:
+                return jwk
+        return None
+
+    jwk = find_key(_get_jwks(jwks_uri))
+    if jwk is None:
+        # Key rotation may have happened; refresh once and retry.
+        jwk = find_key(_get_jwks(jwks_uri, force_refresh=True))
+
+    if jwk is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Token SSO inválido (no se encontró llave de firma para el kid).",
+        )
+
+    try:
+        return RSAAlgorithm.from_jwk(json.dumps(jwk))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail="No fue posible construir la llave de validación del token SSO.",
+        ) from exc
 
 
 def _normalize_issuer(value: str) -> str:
@@ -271,7 +366,7 @@ def _verify_oidc_id_token(id_token: str, nonce: str) -> dict:
     issuer_template = OIDC_ISSUER_OVERRIDE or oidc["issuer"]
 
     try:
-        signing_key = _get_jwk_client(oidc["jwks_uri"]).get_signing_key_from_jwt(id_token).key
+        signing_key = _resolve_signing_key_from_jwks(id_token, oidc["jwks_uri"])
         unverified_claims = jwt.decode(
             id_token,
             options={"verify_signature": False, "verify_exp": False, "verify_aud": False},
@@ -285,8 +380,18 @@ def _verify_oidc_id_token(id_token: str, nonce: str) -> dict:
             audience=OIDC_CLIENT_ID,
             options={"verify_iss": False},
         )
+    except HTTPException:
+        raise
     except InvalidTokenError as exc:
-        raise HTTPException(status_code=401, detail="Token SSO inválido.") from exc
+        raise HTTPException(
+            status_code=401,
+            detail=f"Token SSO inválido: {_safe_error_text(str(exc))}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"No fue posible validar el token SSO ({type(exc).__name__}).",
+        ) from exc
 
     token_issuer = str(claims.get("iss") or "")
     if _normalize_issuer(token_issuer) != _normalize_issuer(expected_issuer):
@@ -407,6 +512,13 @@ def _sso_token_exchange_error(response: httpx.Response) -> str:
     return message
 
 
+def _safe_error_text(value: str) -> str:
+    compact = " ".join((value or "").split()).strip()
+    if not compact:
+        return "No fue posible completar el acceso SSO."
+    return compact[:320]
+
+
 def _extract_aadsts_code(error_text: str) -> str:
     match = re.search(r"AADSTS\d+", error_text, flags=re.IGNORECASE)
     if not match:
@@ -518,7 +630,14 @@ def sso_callback(
     if row["code_verifier"]:
         token_payload["code_verifier"] = row["code_verifier"]
 
-    token_response = httpx.post(oidc["token_endpoint"], data=token_payload, timeout=15)
+    try:
+        token_response = httpx.post(oidc["token_endpoint"], data=token_payload, timeout=15)
+    except httpx.HTTPError:
+        return _redirect_to_login_with_error(
+            request,
+            "No fue posible conectar con el proveedor SSO durante el intercambio del código.",
+        )
+
     if token_response.status_code >= 400:
         first_error = _sso_token_exchange_error(token_response)
         aadsts_code = _extract_aadsts_code(first_error)
@@ -529,19 +648,38 @@ def sso_callback(
         if aadsts_code == "AADSTS7000218" and not sent_secret and OIDC_CLIENT_SECRET:
             retry_payload = dict(token_payload)
             retry_payload["client_secret"] = OIDC_CLIENT_SECRET
-            token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+            try:
+                token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+            except httpx.HTTPError:
+                return _redirect_to_login_with_error(
+                    request,
+                    "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
+                )
         elif aadsts_code == "AADSTS700025" and sent_secret:
             retry_payload = dict(token_payload)
             retry_payload.pop("client_secret", None)
-            token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+            try:
+                token_response = httpx.post(oidc["token_endpoint"], data=retry_payload, timeout=15)
+            except httpx.HTTPError:
+                return _redirect_to_login_with_error(
+                    request,
+                    "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
+                )
         else:
             token_response = token_response
 
         if token_response.status_code >= 400:
             final_error = _sso_token_exchange_error(token_response)
-            return _redirect_to_login_with_error(request, final_error)
+            return _redirect_to_login_with_error(request, _safe_error_text(final_error))
 
-    token_data = token_response.json()
+    try:
+        token_data = token_response.json()
+    except (ValueError, json.JSONDecodeError):
+        return _redirect_to_login_with_error(
+            request,
+            "El proveedor SSO devolvió una respuesta inválida en el intercambio del código.",
+        )
+
     id_token = token_data.get("id_token")
     if not id_token:
         return _redirect_to_login_with_error(request, "El proveedor no devolvió un token válido.")
