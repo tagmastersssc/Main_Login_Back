@@ -40,6 +40,7 @@ Variables clave:
 - `ALLOWED_EMAILS`
 - `REQUIRE_ALLOWLIST`
 - `APP_TOKEN_SECRET`
+- `METRICS_API_URL` o (`METRICS_API_URL_TEMPLATE` + `METRICS_API_ENV` + `METRICS_API_KEY`)
 
 ## Ejecutar
 
@@ -63,6 +64,7 @@ También puedes usar el script local para forzar el `venv` correcto:
 | GET | `/auth/sso/start` | Inicia autenticación SSO |
 | GET | `/auth/sso/callback` | Callback del proveedor OIDC |
 | GET | `/clients/{tax_id}` | Consulta cliente por cédula/NIT (requiere `Authorization: Bearer <token>`) |
+| POST | `/metrics` | Proxy seguro a API externa de métricas (requiere `Authorization: Bearer <token>`) |
 
 ## Nota de despliegue en Azure
 

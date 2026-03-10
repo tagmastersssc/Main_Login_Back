@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 from pathlib import Path
 from typing import Generator
@@ -63,6 +64,16 @@ ALLOWED_EMAILS = {
 }
 
 SSO_STATE_TTL_SECONDS = int(os.getenv("SSO_STATE_TTL_SECONDS", "900"))
+METRICS_API_URL = os.getenv("METRICS_API_URL", "").strip()
+METRICS_API_URL_TEMPLATE = os.getenv("METRICS_API_URL_TEMPLATE", "").strip()
+METRICS_API_ENV = os.getenv("METRICS_API_ENV", "").strip()
+METRICS_API_KEY = os.getenv("METRICS_API_KEY", "").strip()
+METRICS_API_KEY_IN_HEADER = env_bool("METRICS_API_KEY_IN_HEADER", False)
+METRICS_API_KEY_HEADER_NAME = os.getenv("METRICS_API_KEY_HEADER_NAME", "x-functions-key").strip()
+try:
+    METRICS_TIMEOUT_SECONDS = float(os.getenv("METRICS_TIMEOUT_SECONDS", "15"))
+except ValueError:
+    METRICS_TIMEOUT_SECONDS = 15.0
 
 
 @app.middleware("http")
@@ -132,6 +143,13 @@ class ClientResponse(BaseModel):
     tax_id: str
     name: str
     email: str
+
+
+class MetricsRequest(BaseModel):
+    year: str | None = None
+    month: str | None = None
+    Year: str | None = None
+    Month: str | None = None
 
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
@@ -541,6 +559,88 @@ def _extract_aadsts_code(error_text: str) -> str:
     return match.group(0).upper()
 
 
+def _resolve_metrics_api_url() -> str:
+    if METRICS_API_URL:
+        return METRICS_API_URL
+
+    if not METRICS_API_URL_TEMPLATE:
+        return ""
+
+    resolved = METRICS_API_URL_TEMPLATE
+    if "{{env}}" in resolved:
+        if not METRICS_API_ENV:
+            return ""
+        resolved = resolved.replace("{{env}}", METRICS_API_ENV)
+    if "{{key}}" in resolved:
+        if not METRICS_API_KEY:
+            return ""
+        resolved = resolved.replace("{{key}}", METRICS_API_KEY)
+    return resolved
+
+
+def _normalize_year_month(year_raw: str | None, month_raw: str | None) -> tuple[str, str]:
+    now = time.localtime()
+
+    year_value = year_raw.strip() if isinstance(year_raw, str) else ""
+    month_value = month_raw.strip() if isinstance(month_raw, str) else ""
+
+    if not year_value:
+        year_int = now.tm_year
+    else:
+        try:
+            year_int = int(year_value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="El año debe ser numérico (YYYY).") from exc
+
+    if year_int < 2000 or year_int > 2100:
+        raise HTTPException(status_code=400, detail="El año debe estar entre 2000 y 2100.")
+
+    if not month_value:
+        month_int = now.tm_mon
+    else:
+        try:
+            month_int = int(month_value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="El mes debe ser numérico (1-12).") from exc
+
+    if month_int < 1 or month_int > 12:
+        raise HTTPException(status_code=400, detail="El mes debe estar entre 1 y 12.")
+
+    return str(year_int), f"{month_int:02d}"
+
+
+def _parse_metrics_response(response: httpx.Response) -> dict:
+    payload: object | None
+    raw_text = ""
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+
+    if isinstance(payload, dict):
+        return payload
+
+    if isinstance(payload, str):
+        raw_text = payload.strip()
+    else:
+        raw_text = (response.text or "").strip()
+
+    raw_text = raw_text.lstrip("\ufeff")
+    if raw_text:
+        try:
+            literal_payload = ast.literal_eval(raw_text)
+        except (ValueError, SyntaxError):
+            literal_payload = None
+        if isinstance(literal_payload, dict):
+            return literal_payload
+
+    raise HTTPException(
+        status_code=502,
+        detail="El servicio externo de métricas devolvió una respuesta inválida.",
+    )
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -866,6 +966,65 @@ def reset_password(req: ResetPasswordRequest, db: sqlite3.Connection = Depends(g
     )
     db.commit()
     return {"message": "Password updated"}
+
+
+@app.post("/api/metrics")
+@app.post("/metrics")
+def get_metrics(
+    req: MetricsRequest,
+    _: dict = Depends(_require_portal_session),
+):
+    metrics_url = _resolve_metrics_api_url()
+    if not metrics_url:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Métricas no configuradas. Define METRICS_API_URL o "
+                "METRICS_API_URL_TEMPLATE + METRICS_API_ENV + METRICS_API_KEY."
+            ),
+        )
+
+    year, month = _normalize_year_month(req.year or req.Year, req.month or req.Month)
+    payload = {"Year": year, "Month": month}
+    headers = {}
+    if METRICS_API_KEY_IN_HEADER:
+        if not METRICS_API_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="Métricas no configuradas: falta METRICS_API_KEY para autenticación por header.",
+            )
+        header_name = METRICS_API_KEY_HEADER_NAME or "x-functions-key"
+        headers[header_name] = METRICS_API_KEY
+
+    try:
+        response = httpx.post(
+            metrics_url,
+            json=payload,
+            headers=headers or None,
+            timeout=METRICS_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="No fue posible conectar con el servicio externo de métricas.",
+        ) from exc
+
+    if response.status_code >= 400:
+        provider_body = " ".join((response.text or "").split())[:220]
+        message = "El servicio externo de métricas respondió con error."
+        if provider_body:
+            message = f"{message} {provider_body}"
+        raise HTTPException(status_code=502, detail=message)
+
+    metrics = _parse_metrics_response(response)
+
+    if not isinstance(metrics, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="El servicio externo de métricas devolvió un formato inesperado.",
+        )
+
+    return {"year": year, "month": month, "metrics": metrics}
 
 
 @app.get("/clients/{tax_id}", response_model=ClientResponse)
