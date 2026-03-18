@@ -3,8 +3,8 @@ from __future__ import annotations
 import ast
 import base64
 from pathlib import Path
-from typing import Generator
-from urllib.parse import urlencode
+from typing import Any, Generator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import hashlib
 import json
 import os
@@ -70,6 +70,7 @@ METRICS_API_ENV = os.getenv("METRICS_API_ENV", "").strip()
 METRICS_API_KEY = os.getenv("METRICS_API_KEY", "").strip()
 METRICS_API_KEY_IN_HEADER = env_bool("METRICS_API_KEY_IN_HEADER", False)
 METRICS_API_KEY_HEADER_NAME = os.getenv("METRICS_API_KEY_HEADER_NAME", "x-functions-key").strip()
+EXTERNAL_API_BASE_URL = os.getenv("EXTERNAL_API_BASE_URL", "").strip()
 try:
     METRICS_TIMEOUT_SECONDS = float(os.getenv("METRICS_TIMEOUT_SECONDS", "15"))
 except ValueError:
@@ -578,6 +579,67 @@ def _resolve_metrics_api_url() -> str:
     return resolved
 
 
+def _resolve_external_api_base_url() -> str:
+    if EXTERNAL_API_BASE_URL:
+        return EXTERNAL_API_BASE_URL.rstrip("/")
+
+    metrics_url = _resolve_metrics_api_url()
+    if not metrics_url:
+        return ""
+
+    parsed = urlsplit(metrics_url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+
+    base_path = parsed.path.rsplit("/", 1)[0] if "/" in parsed.path else parsed.path
+    normalized_path = base_path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", "")).rstrip("/")
+
+
+def _resolve_external_api_headers() -> dict[str, str]:
+    if not METRICS_API_KEY_IN_HEADER:
+        return {}
+    if not METRICS_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="API externa no configurada: falta METRICS_API_KEY para autenticación por header.",
+        )
+    header_name = METRICS_API_KEY_HEADER_NAME or "x-functions-key"
+    return {header_name: METRICS_API_KEY}
+
+
+def _resolve_external_api_query_auth() -> dict[str, str]:
+    if METRICS_API_KEY_IN_HEADER:
+        return {}
+
+    if METRICS_API_KEY:
+        return {"code": METRICS_API_KEY}
+
+    metrics_url = _resolve_metrics_api_url()
+    if not metrics_url:
+        return {}
+
+    parsed = urlsplit(metrics_url)
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    code = (query_params.get("code") or "").strip()
+    return {"code": code} if code else {}
+
+
+def _build_external_api_url(endpoint_name: str) -> str:
+    base_url = _resolve_external_api_base_url()
+    if not base_url:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "API externa no configurada. Define EXTERNAL_API_BASE_URL o una URL de métricas "
+                "válida para derivar la base."
+            ),
+        )
+
+    normalized_endpoint = endpoint_name.strip().lstrip("/")
+    return f"{base_url}/{normalized_endpoint}"
+
+
 def _normalize_year_month(year_raw: str | None, month_raw: str | None) -> tuple[str, str]:
     now = time.localtime()
 
@@ -639,6 +701,78 @@ def _parse_metrics_response(response: httpx.Response) -> dict:
         status_code=502,
         detail="El servicio externo de métricas devolvió una respuesta inválida.",
     )
+
+
+def _parse_external_api_response(response: httpx.Response) -> Any:
+    payload: Any
+    raw_text = ""
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+
+    if payload is not None:
+        return payload
+
+    raw_text = (response.text or "").strip().lstrip("\ufeff")
+    if raw_text:
+        try:
+            literal_payload = ast.literal_eval(raw_text)
+        except (ValueError, SyntaxError):
+            literal_payload = None
+        if literal_payload is not None:
+            return literal_payload
+        return {"raw": raw_text}
+
+    return {}
+
+
+def _request_external_api(
+    method: str,
+    endpoint_name: str,
+    *,
+    params: dict[str, str] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    url = _build_external_api_url(endpoint_name)
+    request_params = _resolve_external_api_query_auth()
+    if params:
+        for key, value in params.items():
+            if value is not None and value != "":
+                request_params[key] = value
+
+    try:
+        response = httpx.request(
+            method=method,
+            url=url,
+            params=request_params or None,
+            json=json_body,
+            headers=_resolve_external_api_headers() or None,
+            timeout=METRICS_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No fue posible conectar con la API externa en {endpoint_name}.",
+        ) from exc
+
+    if response.status_code >= 400:
+        parsed_error = _parse_external_api_response(response)
+        if isinstance(parsed_error, dict):
+            detail = str(
+                parsed_error.get("detail")
+                or parsed_error.get("message")
+                or parsed_error.get("error")
+                or ""
+            ).strip()
+        else:
+            detail = str(parsed_error).strip()
+        base_message = f"La API externa respondió con error en {endpoint_name}."
+        message = f"{base_message} {detail[:240]}".strip() if detail else base_message
+        raise HTTPException(status_code=502, detail=message)
+
+    return response
 
 
 def hash_password(password: str) -> str:
@@ -968,54 +1102,22 @@ def reset_password(req: ResetPasswordRequest, db: sqlite3.Connection = Depends(g
     return {"message": "Password updated"}
 
 
-@app.post("/api/metrics")
-@app.post("/metrics")
-def get_metrics(
-    req: MetricsRequest,
-    _: dict = Depends(_require_portal_session),
-):
-    metrics_url = _resolve_metrics_api_url()
-    if not metrics_url:
+def _fetch_metrics(year_raw: str | None, month_raw: str | None) -> dict[str, Any]:
+    if not (_resolve_metrics_api_url() or _resolve_external_api_base_url()):
         raise HTTPException(
             status_code=503,
             detail=(
                 "Métricas no configuradas. Define METRICS_API_URL o "
-                "METRICS_API_URL_TEMPLATE + METRICS_API_ENV + METRICS_API_KEY."
+                "EXTERNAL_API_BASE_URL + METRICS_API_KEY."
             ),
         )
 
-    year, month = _normalize_year_month(req.year or req.Year, req.month or req.Month)
-    payload = {"Year": year, "Month": month}
-    headers = {}
-    if METRICS_API_KEY_IN_HEADER:
-        if not METRICS_API_KEY:
-            raise HTTPException(
-                status_code=503,
-                detail="Métricas no configuradas: falta METRICS_API_KEY para autenticación por header.",
-            )
-        header_name = METRICS_API_KEY_HEADER_NAME or "x-functions-key"
-        headers[header_name] = METRICS_API_KEY
-
-    try:
-        response = httpx.post(
-            metrics_url,
-            json=payload,
-            headers=headers or None,
-            timeout=METRICS_TIMEOUT_SECONDS,
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="No fue posible conectar con el servicio externo de métricas.",
-        ) from exc
-
-    if response.status_code >= 400:
-        provider_body = " ".join((response.text or "").split())[:220]
-        message = "El servicio externo de métricas respondió con error."
-        if provider_body:
-            message = f"{message} {provider_body}"
-        raise HTTPException(status_code=502, detail=message)
-
+    year, month = _normalize_year_month(year_raw, month_raw)
+    response = _request_external_api(
+        "GET",
+        "Metrics",
+        params={"Year": year, "Month": month},
+    )
     metrics = _parse_metrics_response(response)
 
     if not isinstance(metrics, dict):
@@ -1025,6 +1127,52 @@ def get_metrics(
         )
 
     return {"year": year, "month": month, "metrics": metrics}
+
+
+@app.get("/api/metrics")
+@app.get("/metrics")
+def get_metrics(
+    _: dict = Depends(_require_portal_session),
+    year: str | None = Query(None),
+    month: str | None = Query(None),
+):
+    return _fetch_metrics(year, month)
+
+
+@app.post("/api/metrics")
+@app.post("/metrics")
+def get_metrics_legacy(
+    req: MetricsRequest,
+    _: dict = Depends(_require_portal_session),
+):
+    return _fetch_metrics(req.year or req.Year, req.month or req.Month)
+
+
+@app.post("/api/invoices")
+def create_invoice(
+    payload: dict[str, Any],
+    _: dict = Depends(_require_portal_session),
+):
+    response = _request_external_api("POST", "GenerateInvoice", json_body=payload)
+    return _parse_external_api_response(response)
+
+
+@app.post("/api/credit-notes")
+def create_credit_note(
+    payload: dict[str, Any],
+    _: dict = Depends(_require_portal_session),
+):
+    response = _request_external_api("POST", "GenerateCreditNote", json_body=payload)
+    return _parse_external_api_response(response)
+
+
+@app.post("/api/debit-notes")
+def create_debit_note(
+    payload: dict[str, Any],
+    _: dict = Depends(_require_portal_session),
+):
+    response = _request_external_api("POST", "GenerateDebitNote", json_body=payload)
+    return _parse_external_api_response(response)
 
 
 @app.get("/clients/{tax_id}", response_model=ClientResponse)

@@ -41,6 +41,7 @@ Variables clave:
 - `REQUIRE_ALLOWLIST`
 - `APP_TOKEN_SECRET`
 - `METRICS_API_URL` o (`METRICS_API_URL_TEMPLATE` + `METRICS_API_ENV` + `METRICS_API_KEY`)
+- `EXTERNAL_API_BASE_URL` (opcional si quieres fijar la base común para `Metrics`, `GenerateInvoice`, `GenerateCreditNote`, `GenerateDebitNote`)
 
 ## Ejecutar
 
@@ -64,7 +65,10 @@ También puedes usar el script local para forzar el `venv` correcto:
 | GET | `/auth/sso/start` | Inicia autenticación SSO |
 | GET | `/auth/sso/callback` | Callback del proveedor OIDC |
 | GET | `/clients/{tax_id}` | Consulta cliente por cédula/NIT (requiere `Authorization: Bearer <token>`) |
-| POST | `/metrics` | Proxy seguro a API externa de métricas (requiere `Authorization: Bearer <token>`) |
+| GET | `/metrics` | Proxy seguro a `GET /Metrics` de la API externa |
+| POST | `/invoices` | Proxy seguro a `POST /GenerateInvoice` |
+| POST | `/credit-notes` | Proxy seguro a `POST /GenerateCreditNote` |
+| POST | `/debit-notes` | Proxy seguro a `POST /GenerateDebitNote` |
 
 ## Nota de despliegue en Azure
 
