@@ -34,6 +34,23 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def normalize_samesite(value: str | None, default: str = "lax") -> str:
+    normalized = (value or default).strip().lower()
+    if normalized not in {"lax", "strict", "none"}:
+        return default
+    return normalized
+
+
+def origin_from_url(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate.startswith(("http://", "https://")):
+        return ""
+    parts = urlsplit(candidate)
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 app = FastAPI()
 
 PASSWORD_AUTH_ENABLED = env_bool("ENABLE_PASSWORD_AUTH", False)
@@ -52,6 +69,11 @@ OIDC_PROVIDER_HINTS = {
 OIDC_ISSUER_OVERRIDE = os.getenv("OIDC_ISSUER", "").strip()
 APP_TOKEN_SECRET = os.getenv("APP_TOKEN_SECRET", "dev-local-secret-change-me")
 APP_TOKEN_TTL_SECONDS = int(os.getenv("APP_TOKEN_TTL_SECONDS", "28800"))
+SESSION_COOKIE_NAME = (os.getenv("SESSION_COOKIE_NAME", "bilai_portal_session") or "bilai_portal_session").strip()
+SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "").strip()
+SESSION_COOKIE_PATH = (os.getenv("SESSION_COOKIE_PATH", "/") or "/").strip() or "/"
+SESSION_COOKIE_SAMESITE = normalize_samesite(os.getenv("SESSION_COOKIE_SAMESITE"), "lax")
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", False)
 CLIENTS_APP_URL_DEFAULT = os.getenv("CLIENTS_APP_URL", "http://localhost:5174").strip()
 LOGIN_FRONT_URL_DEFAULT = os.getenv("LOGIN_FRONT_URL", "http://localhost:5173").strip()
 SSO_REDIRECT_URI = os.getenv("SSO_REDIRECT_URI", "").strip()
@@ -98,9 +120,23 @@ async def sso_callback_error_guard(request: Request, call_next):
 
 
 def _parse_allowed_origins() -> list[str]:
-    raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
-    origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
-    return origins or ["*"]
+    raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if raw_origins:
+        origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
+        return origins or ["*"]
+
+    inferred_origins: list[str] = []
+    for candidate in {
+        LOGIN_FRONT_URL_DEFAULT,
+        CLIENTS_APP_URL_DEFAULT,
+        os.getenv("LOGIN_FRONT_URL", "").strip(),
+        os.getenv("CLIENTS_APP_URL", "").strip(),
+    }:
+        origin = origin_from_url(candidate)
+        if origin and origin not in inferred_origins:
+            inferred_origins.append(origin)
+
+    return inferred_origins or ["http://localhost:5173", "http://localhost:5174"]
 
 
 allowed_origins = _parse_allowed_origins()
@@ -489,6 +525,35 @@ def _decode_portal_token(token: str) -> dict:
     return payload
 
 
+def _is_secure_request(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return forwarded_proto == "https" or request.url.scheme == "https"
+
+
+def _set_portal_session_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=APP_TOKEN_TTL_SECONDS,
+        httponly=True,
+        secure=SESSION_COOKIE_SECURE or _is_secure_request(request),
+        samesite=SESSION_COOKIE_SAMESITE,
+        domain=SESSION_COOKIE_DOMAIN or None,
+        path=SESSION_COOKIE_PATH,
+    )
+
+
+def _clear_portal_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        domain=SESSION_COOKIE_DOMAIN or None,
+        path=SESSION_COOKIE_PATH,
+        secure=SESSION_COOKIE_SECURE or _is_secure_request(request),
+        httponly=True,
+        samesite=SESSION_COOKIE_SAMESITE,
+    )
+
+
 def _create_pkce_pair() -> tuple[str, str]:
     code_verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
@@ -499,9 +564,24 @@ def _create_pkce_pair() -> tuple[str, str]:
 def _require_portal_session(request: Request) -> dict:
     auth_header = request.headers.get("Authorization", "").strip()
     prefix = "Bearer "
-    if not auth_header.startswith(prefix):
-        raise HTTPException(status_code=401, detail="Falta token de autenticación.")
-    return _decode_portal_token(auth_header[len(prefix):].strip())
+    if auth_header.startswith(prefix):
+        return _decode_portal_token(auth_header[len(prefix):].strip())
+
+    cookie_token = request.cookies.get(SESSION_COOKIE_NAME, "").strip()
+    if cookie_token:
+        return _decode_portal_token(cookie_token)
+
+    raise HTTPException(status_code=401, detail="Falta sesión autenticada.")
+
+
+def _serialize_portal_session(payload: dict) -> dict[str, str]:
+    return {
+        "email": str(payload.get("email") or "").strip(),
+        "firstName": str(payload.get("first_name") or "").strip(),
+        "lastName": str(payload.get("last_name") or "").strip(),
+        "name": str(payload.get("name") or "").strip(),
+        "provider": str(payload.get("provider") or "").strip(),
+    }
 
 
 def _redirect_to_login_with_error(request: Request, message: str) -> RedirectResponse:
@@ -817,6 +897,21 @@ def runtime_config_js_api(request: Request):
     return runtime_config_js(request)
 
 
+@app.get("/api/session/me")
+@app.get("/session/me")
+def get_portal_session(request: Request):
+    payload = _require_portal_session(request)
+    return {"authenticated": True, "user": _serialize_portal_session(payload)}
+
+
+@app.post("/api/session/logout")
+@app.post("/session/logout")
+def logout_portal_session(request: Request):
+    response = Response(status_code=204)
+    _clear_portal_session_cookie(response, request)
+    return response
+
+
 @app.get("/api/auth/sso/start")
 @app.get("/auth/sso/start")
 def sso_start(
@@ -990,13 +1085,9 @@ def sso_callback(
         provider=provider,
     )
 
-    clients_url = URL(_get_clients_app_url(request)).include_query_params(
-        token=portal_token,
-        email=email,
-        firstName=first_name,
-        lastName=last_name,
-    )
-    return RedirectResponse(str(clients_url), status_code=302)
+    response = RedirectResponse(_get_clients_app_url(request), status_code=302)
+    _set_portal_session_cookie(response, request, portal_token)
+    return response
 
 
 @app.post("/register")
