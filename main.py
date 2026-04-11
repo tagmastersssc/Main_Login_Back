@@ -74,10 +74,15 @@ SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "").strip()
 SESSION_COOKIE_PATH = (os.getenv("SESSION_COOKIE_PATH", "/") or "/").strip() or "/"
 SESSION_COOKIE_SAMESITE = normalize_samesite(os.getenv("SESSION_COOKIE_SAMESITE"), "lax")
 SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", False)
+DEFAULT_TENANT_ID = os.getenv("DEFAULT_TENANT_ID", "").strip()
 CLIENTS_APP_URL_DEFAULT = os.getenv("CLIENTS_APP_URL", "http://localhost:5174").strip()
+CLIENTS_BACKEND_URL_DEFAULT = os.getenv("CLIENTS_BACKEND_URL", "http://localhost:7071").strip()
 LOGIN_FRONT_URL_DEFAULT = os.getenv("LOGIN_FRONT_URL", "http://localhost:5173").strip()
 SSO_REDIRECT_URI = os.getenv("SSO_REDIRECT_URI", "").strip()
 REQUIRE_ALLOWLIST = env_bool("REQUIRE_ALLOWLIST", False)
+TENANT_EXCHANGE_SECRET_DEFAULT = os.getenv("TENANT_EXCHANGE_SECRET", "").strip()
+TENANT_CONFIG_JSON = os.getenv("TENANT_CONFIG_JSON", "").strip()
+TENANT_LOGIN_CODE_TTL_SECONDS = int(os.getenv("TENANT_LOGIN_CODE_TTL_SECONDS", "300"))
 
 ALLOWED_EMAILS = {
     item.strip().lower()
@@ -189,6 +194,11 @@ class MetricsRequest(BaseModel):
     Month: str | None = None
 
 
+class TenantExchangeRequest(BaseModel):
+    code: str
+    tenant: str | None = None
+
+
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     db_path = os.getenv("DATABASE_PATH", "users.db")
     conn = sqlite3.connect(db_path)
@@ -210,7 +220,9 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
 
     _ensure_clients_table(conn)
     _ensure_sso_state_table(conn)
+    _ensure_tenant_exchange_code_table(conn)
     _cleanup_expired_sso_states(conn)
+    _cleanup_expired_tenant_exchange_codes(conn)
 
     try:
         yield conn
@@ -244,11 +256,14 @@ def _ensure_sso_state_table(conn: sqlite3.Connection) -> None:
         "state TEXT PRIMARY KEY,"
         "nonce TEXT NOT NULL,"
         "provider TEXT NOT NULL,"
+        "tenant_id TEXT,"
         "code_verifier TEXT,"
         "created_at INTEGER NOT NULL"
         ")"
     )
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(sso_states)")}
+    if "tenant_id" not in columns:
+        conn.execute("ALTER TABLE sso_states ADD COLUMN tenant_id TEXT")
     if "code_verifier" not in columns:
         conn.execute("ALTER TABLE sso_states ADD COLUMN code_verifier TEXT")
 
@@ -256,6 +271,31 @@ def _ensure_sso_state_table(conn: sqlite3.Connection) -> None:
 def _cleanup_expired_sso_states(conn: sqlite3.Connection) -> None:
     cutoff = int(time.time()) - SSO_STATE_TTL_SECONDS
     conn.execute("DELETE FROM sso_states WHERE created_at < ?", (cutoff,))
+    conn.commit()
+
+
+def _ensure_tenant_exchange_code_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tenant_exchange_codes ("
+        "code TEXT PRIMARY KEY,"
+        "tenant_id TEXT NOT NULL,"
+        "email TEXT NOT NULL,"
+        "first_name TEXT,"
+        "last_name TEXT,"
+        "display_name TEXT NOT NULL,"
+        "provider TEXT NOT NULL,"
+        "expires_at INTEGER NOT NULL,"
+        "used_at INTEGER"
+        ")"
+    )
+
+
+def _cleanup_expired_tenant_exchange_codes(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.execute(
+        "DELETE FROM tenant_exchange_codes WHERE expires_at < ? OR used_at IS NOT NULL",
+        (now,),
+    )
     conn.commit()
 
 
@@ -270,9 +310,20 @@ def _resolve_url(request: Request, configured: str, fallback: str) -> str:
     return str(URL(_base_origin(request)).replace(path=candidate if candidate.startswith("/") else f"/{candidate}"))
 
 
+def _append_path_to_url(base_url: str, path: str) -> str:
+    parsed = urlsplit(base_url)
+    normalized_path = f"{parsed.path.rstrip('/')}/{path.lstrip('/')}" if parsed.path else f"/{path.lstrip('/')}"
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
 def _get_clients_app_url(request: Request) -> str:
     configured = os.getenv("CLIENTS_APP_URL", "").strip()
     return _resolve_url(request, configured, CLIENTS_APP_URL_DEFAULT)
+
+
+def _get_clients_backend_url(request: Request) -> str:
+    configured = os.getenv("CLIENTS_BACKEND_URL", "").strip()
+    return _resolve_url(request, configured, CLIENTS_BACKEND_URL_DEFAULT)
 
 
 def _get_login_front_url(request: Request) -> str:
@@ -493,6 +544,107 @@ def _is_email_allowed(email: str) -> bool:
     return not REQUIRE_ALLOWLIST
 
 
+def _load_tenant_registry(request: Request) -> dict[str, dict[str, object]]:
+    registry: dict[str, dict[str, object]] = {}
+    if TENANT_CONFIG_JSON:
+        try:
+            raw_registry = json.loads(TENANT_CONFIG_JSON)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=503, detail="TENANT_CONFIG_JSON no tiene un JSON válido.") from exc
+
+        if not isinstance(raw_registry, dict):
+            raise HTTPException(status_code=503, detail="TENANT_CONFIG_JSON debe ser un objeto JSON.")
+
+        for raw_tenant, raw_config in raw_registry.items():
+            tenant_id = str(raw_tenant or "").strip()
+            if not tenant_id or not isinstance(raw_config, dict):
+                continue
+
+            front_url = _resolve_url(
+                request,
+                str(raw_config.get("clients_front_url") or "").strip(),
+                CLIENTS_APP_URL_DEFAULT,
+            )
+            backend_url = _resolve_url(
+                request,
+                str(raw_config.get("clients_backend_url") or "").strip(),
+                CLIENTS_BACKEND_URL_DEFAULT,
+            )
+            allowed_emails = {
+                str(item).strip().lower()
+                for item in raw_config.get("allowed_emails", [])
+                if str(item).strip()
+            }
+            allowed_domains = {
+                str(item).strip().lower()
+                for item in raw_config.get("allowed_email_domains", [])
+                if str(item).strip()
+            }
+            registry[tenant_id] = {
+                "tenant_id": tenant_id,
+                "clients_front_url": front_url,
+                "clients_backend_url": backend_url,
+                "exchange_secret": str(raw_config.get("exchange_secret") or "").strip(),
+                "allowed_emails": allowed_emails,
+                "allowed_email_domains": allowed_domains,
+            }
+
+    default_tenant_id = (DEFAULT_TENANT_ID or "default").strip()
+    if default_tenant_id and default_tenant_id not in registry:
+        registry[default_tenant_id] = {
+            "tenant_id": default_tenant_id,
+            "clients_front_url": _get_clients_app_url(request),
+            "clients_backend_url": _get_clients_backend_url(request),
+            "exchange_secret": TENANT_EXCHANGE_SECRET_DEFAULT,
+            "allowed_emails": set(),
+            "allowed_email_domains": set(),
+        }
+
+    return registry
+
+
+def _resolve_tenant_config(request: Request, requested_tenant: str | None) -> dict[str, object]:
+    tenant_id = (requested_tenant or DEFAULT_TENANT_ID or "").strip()
+    registry = _load_tenant_registry(request)
+
+    if not tenant_id:
+        if len(registry) == 1:
+            return next(iter(registry.values()))
+        raise HTTPException(status_code=400, detail="Falta el tenant del cliente.")
+
+    config = registry.get(tenant_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"No existe configuración para el tenant '{tenant_id}'.")
+    return config
+
+
+def _is_email_allowed_for_tenant(email: str, tenant_config: dict[str, object]) -> bool:
+    normalized_email = email.strip().lower()
+    explicit_emails = tenant_config.get("allowed_emails")
+    allowed_domains = tenant_config.get("allowed_email_domains")
+
+    emails = explicit_emails if isinstance(explicit_emails, set) else set()
+    domains = allowed_domains if isinstance(allowed_domains, set) else set()
+
+    if not emails and not domains:
+        return True
+
+    if normalized_email in emails:
+        return True
+
+    domain = normalized_email.split("@", 1)[1] if "@" in normalized_email else ""
+    return bool(domain and domain in domains)
+
+
+def _tenant_has_allowlist(tenant_config: dict[str, object]) -> bool:
+    explicit_emails = tenant_config.get("allowed_emails")
+    allowed_domains = tenant_config.get("allowed_email_domains")
+
+    emails = explicit_emails if isinstance(explicit_emails, set) else set()
+    domains = allowed_domains if isinstance(allowed_domains, set) else set()
+    return bool(emails or domains)
+
+
 def _create_portal_token(*, email: str, first_name: str, last_name: str, name: str, provider: str) -> str:
     now = int(time.time())
     payload = {
@@ -584,8 +736,39 @@ def _serialize_portal_session(payload: dict) -> dict[str, str]:
     }
 
 
-def _redirect_to_login_with_error(request: Request, message: str) -> RedirectResponse:
+def _store_tenant_exchange_code(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    email: str,
+    first_name: str,
+    last_name: str,
+    name: str,
+    provider: str,
+) -> str:
+    code = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + TENANT_LOGIN_CODE_TTL_SECONDS
+    conn.execute(
+        (
+            "INSERT INTO tenant_exchange_codes "
+            "(code, tenant_id, email, first_name, last_name, display_name, provider, expires_at, used_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+        ),
+        (code, tenant_id, email, first_name, last_name, name, provider, expires_at),
+    )
+    conn.commit()
+    return code
+
+
+def _redirect_to_login_with_error(
+    request: Request,
+    message: str,
+    *,
+    tenant_id: str | None = None,
+) -> RedirectResponse:
     login_url = URL(_get_login_front_url(request)).include_query_params(error=message)
+    if tenant_id:
+        login_url = login_url.include_query_params(tenant=tenant_id)
     return RedirectResponse(str(login_url), status_code=302)
 
 
@@ -912,11 +1095,66 @@ def logout_portal_session(request: Request):
     return response
 
 
+@app.post("/api/auth/tenant/exchange")
+def exchange_tenant_login_code(
+    request: Request,
+    payload: TenantExchangeRequest,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    tenant_config = _resolve_tenant_config(request, payload.tenant)
+    tenant_id = str(tenant_config["tenant_id"])
+    exchange_secret = str(tenant_config.get("exchange_secret") or "").strip()
+    provided_secret = request.headers.get("X-BilAI-Exchange-Secret", "").strip()
+
+    if not exchange_secret or not secrets.compare_digest(exchange_secret, provided_secret):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas para el intercambio del tenant.")
+
+    code = payload.code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Falta el código de intercambio.")
+
+    row = db.execute(
+        (
+            "SELECT tenant_id, email, first_name, last_name, display_name, provider, expires_at, used_at "
+            "FROM tenant_exchange_codes WHERE code = ?"
+        ),
+        (code,),
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="El código de intercambio no existe o ya expiró.")
+
+    if str(row["tenant_id"]) != tenant_id:
+        raise HTTPException(status_code=403, detail="El código no pertenece al tenant solicitado.")
+
+    if row["used_at"] is not None:
+        raise HTTPException(status_code=410, detail="El código de intercambio ya fue consumido.")
+
+    if int(row["expires_at"]) < int(time.time()):
+        raise HTTPException(status_code=410, detail="El código de intercambio expiró.")
+
+    db.execute(
+        "UPDATE tenant_exchange_codes SET used_at = ? WHERE code = ?",
+        (int(time.time()), code),
+    )
+    db.commit()
+
+    user = {
+        "email": str(row["email"] or "").strip(),
+        "firstName": str(row["first_name"] or "").strip(),
+        "lastName": str(row["last_name"] or "").strip(),
+        "name": str(row["display_name"] or "").strip(),
+        "provider": str(row["provider"] or "").strip(),
+    }
+    return {"authenticated": True, "tenant": tenant_id, "user": user}
+
+
 @app.get("/api/auth/sso/start")
 @app.get("/auth/sso/start")
 def sso_start(
     request: Request,
     provider: str = Query("microsoft"),
+    tenant: str | None = Query(None),
     db: sqlite3.Connection = Depends(get_db),
 ):
     provider_key = provider.strip().lower()
@@ -924,17 +1162,21 @@ def sso_start(
         raise HTTPException(status_code=400, detail="Proveedor SSO no soportado.")
 
     try:
+        tenant_config = _resolve_tenant_config(request, tenant)
         oidc = _get_oidc_configuration()
     except HTTPException as exc:
-        return _redirect_to_login_with_error(request, exc.detail)
+        return _redirect_to_login_with_error(request, exc.detail, tenant_id=(tenant or None))
     state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
     # Always use PKCE. Some Entra configurations require it even with server-side code redemption.
     code_verifier, code_challenge = _create_pkce_pair()
 
     db.execute(
-        "INSERT INTO sso_states (state, nonce, provider, code_verifier, created_at) VALUES (?, ?, ?, ?, ?)",
-        (state, nonce, provider_key, code_verifier, int(time.time())),
+        (
+            "INSERT INTO sso_states (state, nonce, provider, tenant_id, code_verifier, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        ),
+        (state, nonce, provider_key, str(tenant_config["tenant_id"]), code_verifier, int(time.time())),
     )
     db.commit()
 
@@ -979,7 +1221,7 @@ def sso_callback(
         return _redirect_to_login_with_error(request, "Respuesta SSO incompleta.")
 
     row = db.execute(
-        "SELECT nonce, provider, code_verifier, created_at FROM sso_states WHERE state = ?",
+        "SELECT nonce, provider, tenant_id, code_verifier, created_at FROM sso_states WHERE state = ?",
         (state,),
     ).fetchone()
     db.execute("DELETE FROM sso_states WHERE state = ?", (state,))
@@ -992,9 +1234,14 @@ def sso_callback(
         return _redirect_to_login_with_error(request, "La sesión SSO expiró. Intenta nuevamente.")
 
     try:
+        tenant_config = _resolve_tenant_config(request, str(row["tenant_id"] or "").strip())
         oidc = _get_oidc_configuration()
     except HTTPException as exc:
-        return _redirect_to_login_with_error(request, exc.detail)
+        return _redirect_to_login_with_error(
+            request,
+            exc.detail,
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
+        )
     token_payload = {
         "grant_type": "authorization_code",
         "code": code,
@@ -1012,6 +1259,7 @@ def sso_callback(
         return _redirect_to_login_with_error(
             request,
             "No fue posible conectar con el proveedor SSO durante el intercambio del código.",
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
         )
 
     if token_response.status_code >= 400:
@@ -1030,6 +1278,7 @@ def sso_callback(
                 return _redirect_to_login_with_error(
                     request,
                     "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
+                    tenant_id=str(row["tenant_id"] or "").strip() or None,
                 )
         elif aadsts_code == "AADSTS700025" and sent_secret:
             retry_payload = dict(token_payload)
@@ -1040,13 +1289,18 @@ def sso_callback(
                 return _redirect_to_login_with_error(
                     request,
                     "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
+                    tenant_id=str(row["tenant_id"] or "").strip() or None,
                 )
         else:
             token_response = token_response
 
         if token_response.status_code >= 400:
             final_error = _sso_token_exchange_error(token_response)
-            return _redirect_to_login_with_error(request, _safe_error_text(final_error))
+            return _redirect_to_login_with_error(
+                request,
+                _safe_error_text(final_error),
+                tenant_id=str(row["tenant_id"] or "").strip() or None,
+            )
 
     try:
         token_data = token_response.json()
@@ -1054,30 +1308,53 @@ def sso_callback(
         return _redirect_to_login_with_error(
             request,
             "El proveedor SSO devolvió una respuesta inválida en el intercambio del código.",
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
         )
 
     id_token = token_data.get("id_token")
     if not id_token:
-        return _redirect_to_login_with_error(request, "El proveedor no devolvió un token válido.")
+        return _redirect_to_login_with_error(
+            request,
+            "El proveedor no devolvió un token válido.",
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
+        )
 
     try:
         claims = _verify_oidc_id_token(id_token, nonce=row["nonce"])
     except HTTPException as exc:
-        return _redirect_to_login_with_error(request, exc.detail)
+        return _redirect_to_login_with_error(
+            request,
+            exc.detail,
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
+        )
 
     email = _extract_email(claims)
     if not email:
-        return _redirect_to_login_with_error(request, "No pudimos identificar el correo del usuario.")
+        return _redirect_to_login_with_error(
+            request,
+            "No pudimos identificar el correo del usuario.",
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
+        )
 
-    if not _is_email_allowed(email):
+    if _tenant_has_allowlist(tenant_config):
+        if not _is_email_allowed_for_tenant(email, tenant_config):
+            return _redirect_to_login_with_error(
+                request,
+                "Tu correo no está habilitado para este tenant de BilAI.",
+                tenant_id=str(row["tenant_id"] or "").strip() or None,
+            )
+    elif not _is_email_allowed(email):
         return _redirect_to_login_with_error(
             request,
             "Tu correo no está autorizado para ingresar a BilAI.",
+            tenant_id=str(row["tenant_id"] or "").strip() or None,
         )
 
     first_name, last_name, name = _extract_name_parts(claims, email)
     provider = str(row["provider"])
-    portal_token = _create_portal_token(
+    exchange_code = _store_tenant_exchange_code(
+        db,
+        tenant_id=str(tenant_config["tenant_id"]),
         email=email,
         first_name=first_name,
         last_name=last_name,
@@ -1085,9 +1362,10 @@ def sso_callback(
         provider=provider,
     )
 
-    response = RedirectResponse(_get_clients_app_url(request), status_code=302)
-    _set_portal_session_cookie(response, request, portal_token)
-    return response
+    bootstrap_url = URL(
+        _append_path_to_url(str(tenant_config["clients_backend_url"]), "/api/auth/session/bootstrap")
+    ).include_query_params(code=exchange_code, tenant=str(tenant_config["tenant_id"]))
+    return RedirectResponse(str(bootstrap_url), status_code=302)
 
 
 @app.post("/register")

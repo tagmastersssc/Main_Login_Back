@@ -6,13 +6,17 @@ cd /Users/santiago/Documents/BilAI/Code/Main_Login_Back
 
 Backend de autenticación para BilAI con **SSO por OIDC** (recomendado: Microsoft Entra External ID como broker para Google, Microsoft y Apple).
 
+BilAI usa **un solo tenant de Azure / Entra**. Cuando en este repositorio aparece `tenant`, se refiere al **cliente lógico de BilAI** (`client1`, `client2`, etc.), cada uno con su propio frontend, backend y dominio dedicados.
+
 ## Qué hace
 
 - Inicia flujo SSO: `GET /auth/sso/start?provider=google|microsoft|apple`
 - Recibe callback OIDC: `GET /auth/sso/callback`
 - Valida `id_token` contra JWKS del proveedor
 - Aplica **allowlist de correos**
-- Redirige al portal de clientes con token de sesión BilAI
+- Emite un código corto de un solo uso para el cliente lógico autenticado
+- Redirige al `Clients_Invoice_Back` dedicado del cliente
+- El backend del cliente crea la cookie `HttpOnly` final del tenant
 
 > El login por contraseña queda deshabilitado por defecto (`ENABLE_PASSWORD_AUTH=false`).
 
@@ -36,7 +40,11 @@ Variables clave:
 - `OIDC_PUBLIC_CLIENT` (`true` para app pública sin secret; `false` para confidential client)
 - `SSO_REDIRECT_URI`
 - `LOGIN_FRONT_URL`
-- `CLIENTS_APP_URL`
+- `CLIENTS_APP_URL` (fallback solo para desarrollo)
+- `CLIENTS_BACKEND_URL` (fallback solo para desarrollo)
+- `DEFAULT_TENANT_ID` (opcional)
+- `TENANT_EXCHANGE_SECRET` (opcional si usas `TENANT_CONFIG_JSON`)
+- `TENANT_CONFIG_JSON` (registro central recomendado para clientes dedicados)
 - `ALLOWED_EMAILS`
 - `REQUIRE_ALLOWLIST`
 - `APP_TOKEN_SECRET`
@@ -64,6 +72,7 @@ También puedes usar el script local para forzar el `venv` correcto:
 | GET | `/auth/sso/providers` | Estado y proveedores SSO disponibles |
 | GET | `/auth/sso/start` | Inicia autenticación SSO |
 | GET | `/auth/sso/callback` | Callback del proveedor OIDC |
+| POST | `/api/auth/tenant/exchange` | Intercambio server-to-server del código corto hacia el backend del tenant |
 | GET | `/clients/{tax_id}` | Consulta cliente por cédula/NIT (requiere `Authorization: Bearer <token>`) |
 | GET | `/metrics` | Proxy seguro a `GET /Metrics` de la API externa |
 | POST | `/invoices` | Proxy seguro a `POST /GenerateInvoice` |
