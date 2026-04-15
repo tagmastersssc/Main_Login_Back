@@ -1,10 +1,10 @@
 cd /Users/santiago/Documents/BilAI/Code/Main_Login_Back
-/Users/santiago/Documents/BilAI/Code/Main_Login_Back/venv/bin/python -m uvicorn main:app --reload --port 8000
+./run_local.sh
 
 
 # Main_Login_Back (SSO)
 
-Backend de autenticación para BilAI con **SSO por OIDC** (recomendado: Microsoft Entra External ID como broker para Google, Microsoft y Apple).
+Backend de autenticación para BilAI con **SSO por OIDC** (recomendado: Microsoft Entra External ID como broker para Google, Microsoft y Apple), empaquetado para ejecutarse como **Azure Function**.
 
 BilAI usa **un solo tenant de Azure / Entra**. Cuando en este repositorio aparece `tenant`, se refiere al **cliente lógico de BilAI** (`client1`, `client2`, etc.), cada uno con su propio frontend, backend y dominio dedicados.
 
@@ -26,10 +26,17 @@ BilAI usa **un solo tenant de Azure / Entra**. Cuando en este repositorio aparec
 pip install -r requirements.txt
 ```
 
+Para desarrollo local con Functions:
+
+```bash
+npm install -g azure-functions-core-tools@4 --unsafe-perm true
+```
+
 ## Configuración
 
 1. Copia `.env.example` a `.env`.
-2. Ajusta los valores OIDC y URLs según tu entorno.
+2. Copia `local.settings.example.json` a `local.settings.json` si vas a usar `func start`.
+3. Ajusta los valores OIDC y URLs según tu entorno.
 
 Variables clave:
 
@@ -54,14 +61,16 @@ Variables clave:
 ## Ejecutar
 
 ```bash
-uvicorn main:app --reload --port 8000
+func start --port 8000
 ```
 
-También puedes usar el script local para forzar el `venv` correcto:
+También puedes usar el script local:
 
 ```bash
 ./run_local.sh
 ```
+
+`run_local.sh` intentará usar Azure Functions Core Tools y, si no están instaladas, caerá en `uvicorn` como fallback local. La app principal sigue viviendo en `main.py`, y Azure Functions la expone a través de `function_app.py`.
 
 ## Endpoints principales
 
@@ -81,7 +90,7 @@ También puedes usar el script local para forzar el `venv` correcto:
 
 ## Nota de despliegue en Azure
 
-Si usas Entra como broker social (Google/Microsoft/Apple), configura los IdP en Entra y usa el `OIDC_DISCOVERY_URL` del tenant/policy que corresponda.
+El despliegue de este repositorio ahora está preparado para **Azure Function App**. Si usas Entra como broker social (Google/Microsoft/Apple), configura los IdP en Entra y usa el `OIDC_DISCOVERY_URL` del tenant/policy que corresponda.
 
 ## Error AADSTS50020 (usuario externo no existe en el tenant)
 
