@@ -2,7 +2,7 @@
 name: Build and deploy Python project to Azure Function App
 
 env:
-  AZURE_FUNCTIONAPP_NAME: Main-Login-back-${{github.ref_name}}-eastus
+  AZURE_FUNCTIONAPP_NAME: main-Login-back-${{github.ref_name}}-eastus
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.13'
   #
