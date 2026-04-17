@@ -26,6 +26,42 @@ from starlette.datastructures import URL
 
 load_dotenv()
 
+APP_ROOT = Path(__file__).resolve().parent
+
+
+def _running_in_azure_functions() -> bool:
+    return bool(
+        os.getenv("FUNCTIONS_WORKER_RUNTIME")
+        or os.getenv("WEBSITE_INSTANCE_ID")
+        or os.getenv("FUNCTIONS_EXTENSION_VERSION")
+    )
+
+
+def _resolve_writable_data_dir() -> Path:
+    explicit_dir = (os.getenv("MAIN_LOGIN_BACK_DATA_DIR", "") or "").strip()
+    if explicit_dir:
+        path = Path(explicit_dir).expanduser()
+    elif _running_in_azure_functions():
+        path = Path(os.getenv("TMPDIR") or "/tmp") / "main_login_back"
+    else:
+        path = APP_ROOT
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+WRITABLE_DATA_DIR = _resolve_writable_data_dir()
+
+
+def _resolve_database_path() -> str:
+    configured = (os.getenv("DATABASE_PATH", "users.db") or "users.db").strip()
+    if not configured:
+        configured = "users.db"
+    db_path = Path(configured).expanduser()
+    if not db_path.is_absolute():
+        db_path = WRITABLE_DATA_DIR / db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(db_path)
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -200,7 +236,7 @@ class TenantExchangeRequest(BaseModel):
 
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
-    db_path = os.getenv("DATABASE_PATH", "users.db")
+    db_path = _resolve_database_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
@@ -1569,7 +1605,7 @@ def get_client(
     }
 
 
-OUTBOX_DIR = Path("outbox")
+OUTBOX_DIR = WRITABLE_DATA_DIR / "outbox"
 
 
 def _sanitize_email_for_filename(email: str) -> str:

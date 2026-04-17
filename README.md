@@ -55,6 +55,7 @@ Variables clave:
 - `ALLOWED_EMAILS`
 - `REQUIRE_ALLOWLIST`
 - `APP_TOKEN_SECRET`
+- `MAIN_LOGIN_BACK_DATA_DIR` (opcional para forzar un directorio escribible donde guardar `users.db` y `outbox`; en Azure Functions, si no se define, se usa un directorio temporal)
 - `METRICS_API_URL` o (`METRICS_API_URL_TEMPLATE` + `METRICS_API_ENV` + `METRICS_API_KEY`)
 - `EXTERNAL_API_BASE_URL` (opcional si quieres fijar la base común para `Metrics`, `GenerateInvoice`, `GenerateCreditNote`, `GenerateDebitNote`)
 

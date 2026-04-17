@@ -5,6 +5,7 @@
     "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
     "AzureWebJobsStorage": "",
     "DATABASE_PATH": "users.db",
+    "MAIN_LOGIN_BACK_DATA_DIR": "",
     "ENABLE_PASSWORD_AUTH": "false",
     "OIDC_DISCOVERY_URL": "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration",
     "OIDC_TENANT_ID": "",
