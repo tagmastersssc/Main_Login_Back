@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, Response
-from jwt import InvalidTokenError
+from jwt import ExpiredSignatureError, InvalidTokenError
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel
 from starlette.datastructures import URL
@@ -105,6 +105,10 @@ OIDC_PROVIDER_HINTS = {
 OIDC_ISSUER_OVERRIDE = os.getenv("OIDC_ISSUER", "").strip()
 APP_TOKEN_SECRET = os.getenv("APP_TOKEN_SECRET", "dev-local-secret-change-me")
 APP_TOKEN_TTL_SECONDS = int(os.getenv("APP_TOKEN_TTL_SECONDS", "28800"))
+SSO_STATE_SIGNING_SECRET = (os.getenv("SSO_STATE_SIGNING_SECRET", APP_TOKEN_SECRET) or APP_TOKEN_SECRET).strip()
+TENANT_EXCHANGE_SIGNING_SECRET = (
+    os.getenv("TENANT_EXCHANGE_SIGNING_SECRET", APP_TOKEN_SECRET) or APP_TOKEN_SECRET
+).strip()
 SESSION_COOKIE_NAME = (os.getenv("SESSION_COOKIE_NAME", "bilai_portal_session") or "bilai_portal_session").strip()
 SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "").strip()
 SESSION_COOKIE_PATH = (os.getenv("SESSION_COOKIE_PATH", "/") or "/").strip() or "/"
@@ -772,8 +776,7 @@ def _serialize_portal_session(payload: dict) -> dict[str, str]:
     }
 
 
-def _store_tenant_exchange_code(
-    conn: sqlite3.Connection,
+def _create_tenant_exchange_code(
     *,
     tenant_id: str,
     email: str,
@@ -782,18 +785,71 @@ def _store_tenant_exchange_code(
     name: str,
     provider: str,
 ) -> str:
-    code = secrets.token_urlsafe(32)
-    expires_at = int(time.time()) + TENANT_LOGIN_CODE_TTL_SECONDS
-    conn.execute(
-        (
-            "INSERT INTO tenant_exchange_codes "
-            "(code, tenant_id, email, first_name, last_name, display_name, provider, expires_at, used_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
-        ),
-        (code, tenant_id, email, first_name, last_name, name, provider, expires_at),
-    )
-    conn.commit()
-    return code
+    now = int(time.time())
+    payload = {
+        "kind": "tenant_exchange",
+        "tenant_id": tenant_id,
+        "email": email,
+        "first_name": first_name,
+        "last_name": last_name,
+        "display_name": name,
+        "provider": provider,
+        "iat": now,
+        "exp": now + TENANT_LOGIN_CODE_TTL_SECONDS,
+    }
+    return jwt.encode(payload, TENANT_EXCHANGE_SIGNING_SECRET, algorithm="HS256")
+
+
+def _decode_tenant_exchange_code(code: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(
+            code,
+            TENANT_EXCHANGE_SIGNING_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "iat", "tenant_id", "email"]},
+        )
+    except ExpiredSignatureError as exc:
+        raise HTTPException(status_code=410, detail="El código de intercambio expiró.") from exc
+    except InvalidTokenError as exc:
+        raise HTTPException(status_code=404, detail="El código de intercambio no existe o ya expiró.") from exc
+
+    if str(payload.get("kind") or "").strip() != "tenant_exchange":
+        raise HTTPException(status_code=404, detail="El código de intercambio no existe o ya expiró.")
+
+    return payload
+
+
+def _create_sso_state_token(*, nonce: str, provider: str, tenant_id: str, code_verifier: str) -> str:
+    now = int(time.time())
+    payload = {
+        "kind": "sso_state",
+        "nonce": nonce,
+        "provider": provider,
+        "tenant_id": tenant_id,
+        "code_verifier": code_verifier,
+        "iat": now,
+        "exp": now + SSO_STATE_TTL_SECONDS,
+    }
+    return jwt.encode(payload, SSO_STATE_SIGNING_SECRET, algorithm="HS256")
+
+
+def _decode_sso_state_token(state: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(
+            state,
+            SSO_STATE_SIGNING_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "iat", "nonce", "provider", "tenant_id"]},
+        )
+    except ExpiredSignatureError as exc:
+        raise HTTPException(status_code=410, detail="La sesión SSO expiró. Intenta nuevamente.") from exc
+    except InvalidTokenError as exc:
+        raise HTTPException(status_code=400, detail="La sesión SSO no es válida. Intenta nuevamente.") from exc
+
+    if str(payload.get("kind") or "").strip() != "sso_state":
+        raise HTTPException(status_code=400, detail="La sesión SSO no es válida. Intenta nuevamente.")
+
+    return payload
 
 
 def _redirect_to_login_with_error(
@@ -1135,7 +1191,6 @@ def logout_portal_session(request: Request):
 def exchange_tenant_login_code(
     request: Request,
     payload: TenantExchangeRequest,
-    db: sqlite3.Connection = Depends(get_db),
 ):
     tenant_config = _resolve_tenant_config(request, payload.tenant)
     tenant_id = str(tenant_config["tenant_id"])
@@ -1149,38 +1204,17 @@ def exchange_tenant_login_code(
     if not code:
         raise HTTPException(status_code=400, detail="Falta el código de intercambio.")
 
-    row = db.execute(
-        (
-            "SELECT tenant_id, email, first_name, last_name, display_name, provider, expires_at, used_at "
-            "FROM tenant_exchange_codes WHERE code = ?"
-        ),
-        (code,),
-    ).fetchone()
+    token_payload = _decode_tenant_exchange_code(code)
 
-    if not row:
-        raise HTTPException(status_code=404, detail="El código de intercambio no existe o ya expiró.")
-
-    if str(row["tenant_id"]) != tenant_id:
+    if str(token_payload["tenant_id"]) != tenant_id:
         raise HTTPException(status_code=403, detail="El código no pertenece al tenant solicitado.")
 
-    if row["used_at"] is not None:
-        raise HTTPException(status_code=410, detail="El código de intercambio ya fue consumido.")
-
-    if int(row["expires_at"]) < int(time.time()):
-        raise HTTPException(status_code=410, detail="El código de intercambio expiró.")
-
-    db.execute(
-        "UPDATE tenant_exchange_codes SET used_at = ? WHERE code = ?",
-        (int(time.time()), code),
-    )
-    db.commit()
-
     user = {
-        "email": str(row["email"] or "").strip(),
-        "firstName": str(row["first_name"] or "").strip(),
-        "lastName": str(row["last_name"] or "").strip(),
-        "name": str(row["display_name"] or "").strip(),
-        "provider": str(row["provider"] or "").strip(),
+        "email": str(token_payload.get("email") or "").strip(),
+        "firstName": str(token_payload.get("first_name") or "").strip(),
+        "lastName": str(token_payload.get("last_name") or "").strip(),
+        "name": str(token_payload.get("display_name") or "").strip(),
+        "provider": str(token_payload.get("provider") or "").strip(),
     }
     return {"authenticated": True, "tenant": tenant_id, "user": user}
 
@@ -1191,7 +1225,6 @@ def sso_start(
     request: Request,
     provider: str = Query("microsoft"),
     tenant: str | None = Query(None),
-    db: sqlite3.Connection = Depends(get_db),
 ):
     provider_key = provider.strip().lower()
     if provider_key not in {"google", "microsoft", "apple"}:
@@ -1202,19 +1235,15 @@ def sso_start(
         oidc = _get_oidc_configuration()
     except HTTPException as exc:
         return _redirect_to_login_with_error(request, exc.detail, tenant_id=(tenant or None))
-    state = secrets.token_urlsafe(24)
     nonce = secrets.token_urlsafe(24)
     # Always use PKCE. Some Entra configurations require it even with server-side code redemption.
     code_verifier, code_challenge = _create_pkce_pair()
-
-    db.execute(
-        (
-            "INSERT INTO sso_states (state, nonce, provider, tenant_id, code_verifier, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)"
-        ),
-        (state, nonce, provider_key, str(tenant_config["tenant_id"]), code_verifier, int(time.time())),
+    state = _create_sso_state_token(
+        nonce=nonce,
+        provider=provider_key,
+        tenant_id=str(tenant_config["tenant_id"]),
+        code_verifier=code_verifier,
     )
-    db.commit()
 
     params = {
         "client_id": OIDC_CLIENT_ID,
@@ -1245,7 +1274,6 @@ def sso_callback(
     state: str | None = None,
     error: str | None = None,
     error_description: str | None = None,
-    db: sqlite3.Connection = Depends(get_db),
 ):
     if error:
         return _redirect_to_login_with_error(
@@ -1256,27 +1284,19 @@ def sso_callback(
     if not code or not state:
         return _redirect_to_login_with_error(request, "Respuesta SSO incompleta.")
 
-    row = db.execute(
-        "SELECT nonce, provider, tenant_id, code_verifier, created_at FROM sso_states WHERE state = ?",
-        (state,),
-    ).fetchone()
-    db.execute("DELETE FROM sso_states WHERE state = ?", (state,))
-    db.commit()
-
-    if not row:
-        return _redirect_to_login_with_error(request, "La sesión SSO expiró. Intenta nuevamente.")
-
-    if int(time.time()) - int(row["created_at"]) > SSO_STATE_TTL_SECONDS:
-        return _redirect_to_login_with_error(request, "La sesión SSO expiró. Intenta nuevamente.")
+    try:
+        state_payload = _decode_sso_state_token(state)
+    except HTTPException as exc:
+        return _redirect_to_login_with_error(request, exc.detail)
 
     try:
-        tenant_config = _resolve_tenant_config(request, str(row["tenant_id"] or "").strip())
+        tenant_config = _resolve_tenant_config(request, str(state_payload["tenant_id"] or "").strip())
         oidc = _get_oidc_configuration()
     except HTTPException as exc:
         return _redirect_to_login_with_error(
             request,
             exc.detail,
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
     token_payload = {
         "grant_type": "authorization_code",
@@ -1286,16 +1306,16 @@ def sso_callback(
     }
     if OIDC_CLIENT_SECRET and not OIDC_PUBLIC_CLIENT:
         token_payload["client_secret"] = OIDC_CLIENT_SECRET
-    if row["code_verifier"]:
-        token_payload["code_verifier"] = row["code_verifier"]
+    if state_payload.get("code_verifier"):
+        token_payload["code_verifier"] = state_payload["code_verifier"]
 
     try:
         token_response = httpx.post(oidc["token_endpoint"], data=token_payload, timeout=15)
     except httpx.HTTPError:
         return _redirect_to_login_with_error(
             request,
-            "No fue posible conectar con el proveedor SSO durante el intercambio del código.",
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+                    "No fue posible conectar con el proveedor SSO durante el intercambio del código.",
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     if token_response.status_code >= 400:
@@ -1314,7 +1334,7 @@ def sso_callback(
                 return _redirect_to_login_with_error(
                     request,
                     "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
-                    tenant_id=str(row["tenant_id"] or "").strip() or None,
+                    tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
                 )
         elif aadsts_code == "AADSTS700025" and sent_secret:
             retry_payload = dict(token_payload)
@@ -1325,7 +1345,7 @@ def sso_callback(
                 return _redirect_to_login_with_error(
                     request,
                     "No fue posible conectar con el proveedor SSO durante el reintento de autenticación.",
-                    tenant_id=str(row["tenant_id"] or "").strip() or None,
+                    tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
                 )
         else:
             token_response = token_response
@@ -1335,7 +1355,7 @@ def sso_callback(
             return _redirect_to_login_with_error(
                 request,
                 _safe_error_text(final_error),
-                tenant_id=str(row["tenant_id"] or "").strip() or None,
+                tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
             )
 
     try:
@@ -1344,7 +1364,7 @@ def sso_callback(
         return _redirect_to_login_with_error(
             request,
             "El proveedor SSO devolvió una respuesta inválida en el intercambio del código.",
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     id_token = token_data.get("id_token")
@@ -1352,16 +1372,16 @@ def sso_callback(
         return _redirect_to_login_with_error(
             request,
             "El proveedor no devolvió un token válido.",
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     try:
-        claims = _verify_oidc_id_token(id_token, nonce=row["nonce"])
+        claims = _verify_oidc_id_token(id_token, nonce=str(state_payload["nonce"]))
     except HTTPException as exc:
         return _redirect_to_login_with_error(
             request,
             exc.detail,
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     email = _extract_email(claims)
@@ -1369,7 +1389,7 @@ def sso_callback(
         return _redirect_to_login_with_error(
             request,
             "No pudimos identificar el correo del usuario.",
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     if _tenant_has_allowlist(tenant_config):
@@ -1377,19 +1397,18 @@ def sso_callback(
             return _redirect_to_login_with_error(
                 request,
                 "Tu correo no está habilitado para este tenant de BilAI.",
-                tenant_id=str(row["tenant_id"] or "").strip() or None,
+                tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
             )
     elif not _is_email_allowed(email):
         return _redirect_to_login_with_error(
             request,
             "Tu correo no está autorizado para ingresar a BilAI.",
-            tenant_id=str(row["tenant_id"] or "").strip() or None,
+            tenant_id=str(state_payload["tenant_id"] or "").strip() or None,
         )
 
     first_name, last_name, name = _extract_name_parts(claims, email)
-    provider = str(row["provider"])
-    exchange_code = _store_tenant_exchange_code(
-        db,
+    provider = str(state_payload["provider"])
+    exchange_code = _create_tenant_exchange_code(
         tenant_id=str(tenant_config["tenant_id"]),
         email=email,
         first_name=first_name,
