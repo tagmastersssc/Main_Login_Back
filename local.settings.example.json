@@ -28,6 +28,8 @@
     "DEFAULT_TENANT_ID": "",
     "CLIENTS_APP_URL": "http://localhost:5174",
     "CLIENTS_BACKEND_URL": "http://localhost:7071",
+    "CLIENTS_BACKEND_URL_TEMPLATE": "",
+    "CLIENTS_BACKEND_LOCATION": "",
     "LOGIN_FRONT_URL": "http://localhost:5173",
     "SSO_REDIRECT_URI": "http://localhost:8000/auth/sso/callback",
     "REQUIRE_ALLOWLIST": "false",
@@ -35,6 +37,7 @@
     "TENANT_CONFIG_JSON": "",
     "TENANT_LOGIN_CODE_TTL_SECONDS": "300",
     "ALLOWED_EMAILS": "",
+    "USERS_TABLE_NAME": "Users",
     "SSO_STATE_TTL_SECONDS": "900",
     "ALLOWED_ORIGINS": "http://localhost:5173,http://localhost:5174",
     "METRICS_API_URL": "",
@@ -44,6 +47,7 @@
     "METRICS_API_KEY_IN_HEADER": "false",
     "METRICS_API_KEY_HEADER_NAME": "x-functions-key",
     "EXTERNAL_API_BASE_URL": "",
-    "METRICS_TIMEOUT_SECONDS": "15"
+    "METRICS_TIMEOUT_SECONDS": "15",
+    "StorageTable": ""
   }
 }

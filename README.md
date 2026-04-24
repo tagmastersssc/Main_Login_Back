@@ -13,8 +13,9 @@ BilAI usa **un solo tenant de Azure / Entra**. Cuando en este repositorio aparec
 - Inicia flujo SSO: `GET /auth/sso/start?provider=google|microsoft|apple`
 - Recibe callback OIDC: `GET /auth/sso/callback`
 - Valida `id_token` contra JWKS del proveedor
-- Aplica **allowlist de correos**
-- Emite un código corto de un solo uso para el cliente lógico autenticado
+- Consulta la tabla `Users` en Azure Table Storage usando `PartitionKey=email`
+- Toma el `RowKey` como tenant lógico del cliente (`Client1`, `Client2`, `Client3`, etc.)
+- Emite un código corto de intercambio para el cliente lógico autenticado
 - Redirige al `Clients_Invoice_Back` dedicado del cliente
 - El backend del cliente crea la cookie `HttpOnly` final del tenant
 
@@ -49,9 +50,13 @@ Variables clave:
 - `LOGIN_FRONT_URL`
 - `CLIENTS_APP_URL` (fallback solo para desarrollo)
 - `CLIENTS_BACKEND_URL` (fallback solo para desarrollo)
+- `CLIENTS_BACKEND_URL_TEMPLATE` (opcional, por ejemplo `https://{tenant_slug}-back-{environment}-centralus.azurewebsites.net`)
+- `CLIENTS_BACKEND_LOCATION` (opcional si no usas template)
 - `DEFAULT_TENANT_ID` (opcional)
 - `TENANT_EXCHANGE_SECRET` (opcional si usas `TENANT_CONFIG_JSON`)
 - `TENANT_CONFIG_JSON` (registro central recomendado para clientes dedicados)
+- `USERS_TABLE_NAME` (`Users` por defecto)
+- `StorageTable` o `CUSTOMCONNSTR_StorageTable` (connection string del storage account que contiene la tabla `Users`)
 - `ALLOWED_EMAILS`
 - `REQUIRE_ALLOWLIST`
 - `APP_TOKEN_SECRET`
@@ -111,3 +116,31 @@ Tienes dos opciones:
 
 Si Terraform y pipeline no comparten variables de build, puedes definir `VITE_*` como variables de entorno del backend.
 El backend las expone en `/runtime-config.js` y los frontends las leen en tiempo de ejecución.
+
+## Tabla `Users`
+
+El acceso SSO ya no depende de `?tenant=...` en la URL ni de usuarios quemados desde Terraform.
+
+La tabla `Users` debe guardar:
+
+- `PartitionKey`: correo del usuario en minúsculas
+- `RowKey`: tenant lógico del cliente, por ejemplo `Client3`
+
+Ejemplos:
+
+- `PartitionKey = santiagomejia.r02@gmail.com`
+- `RowKey = Client1`
+
+- `PartitionKey = gonzalez915@outlook.com`
+- `RowKey = Client3`
+
+Cuando el usuario termina el login SSO:
+
+1. BilAI valida el correo en la tabla `Users`.
+2. Usa el `RowKey` como tenant.
+3. Construye el frontend del cliente con el patrón `clientx.<env>.<dominio>`.
+4. Redirige al backend del cliente para completar el bootstrap de sesión.
+
+Si el usuario no existe en la tabla o no tiene `RowKey`, el acceso se rechaza con el mensaje:
+
+- `El usuario no tiene un tenant asignado en BilAI.`
