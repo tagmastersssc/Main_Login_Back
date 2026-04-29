@@ -3,3 +3,9 @@ venv
 .DS_Store
 __pycache__
 .env
+venv/
+__pycache__/
+*.pyc
+*.db
+.env
+local.settings.json
